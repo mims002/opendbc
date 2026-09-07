@@ -3,7 +3,6 @@ import time
 import numpy as np
 from opendbc.can import CANPacker
 from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, Bus, DT_CTRL, apply_hysteresis, structs
-from opendbc.car.lateral import ISO_LATERAL_ACCEL, AngleSteeringLimits, apply_std_steer_angle_limits
 from opendbc.car.ford import fordcan
 from opendbc.car.ford.values import CarControllerParams, FordFlags, CAR
 from opendbc.car.interfaces import CarControllerBase, V_CRUISE_MAX
@@ -11,35 +10,12 @@ from opendbc.car.interfaces import CarControllerBase, V_CRUISE_MAX
 LongCtrlState = structs.CarControl.Actuators.LongControlState
 VisualAlert = structs.CarControl.HUDControl.VisualAlert
 
-# CAN FD limits:
-# Limit to average banked road since safety doesn't have the roll
-AVERAGE_ROAD_ROLL = 0.06  # ~3.4 degrees, 6% superelevation. higher actual roll raises lateral acceleration
-MAX_LATERAL_ACCEL = ISO_LATERAL_ACCEL - (ACCELERATION_DUE_TO_GRAVITY * AVERAGE_ROAD_ROLL)  # ~2.4 m/s^2
-
 # Hard-coded LKA payload for bench testing.
 HARDCODED_LKA_APPLY_ANGLE_DEG = 2.93
 HARDCODED_LKA_CURVATURE = 0.0
 HARDCODED_LKA_DIRECTION = 2
 HARDCODED_LKA_RAMP_TYPE = 1
 HARDCODED_LKA_RAMP_STEP_DEG = 0.15
-
-
-class CarControllerParamsBronco:
-  STEER_STEP = 5
-  LKA_STEP = 3
-  ACC_CONTROL_STEP = 2
-  LKAS_UI_STEP = 100
-  ACC_UI_STEP = 20
-  BUTTONS_STEP = 5
-
-  CURVATURE_MAX = 0.02
-  STEER_DRIVER_ALLOWANCE = 1.0
-  ANGLE_LIMITS: AngleSteeringLimits = AngleSteeringLimits(
-    5.86,  # Lane_Assist_Data1 LaRefAng_No_Req saturates at about +/-102.3 mrad ~= +/-5.86 deg
-    ([5, 25], [0.5, 0.5]),
-    ([5, 25], [0.5, 0.5]),
-  )
-  CURVATURE_ERROR = 0.002
 
 
 def anti_overshoot(apply_curvature, apply_curvature_last, v_ego):
@@ -56,25 +32,6 @@ def anti_overshoot(apply_curvature, apply_curvature_last, v_ego):
   output_curvature = last_lataccel / (max(v_ego, 1) ** 2)
 
   return float(np.interp(v_ego, [5, 10], [apply_curvature, output_curvature]))
-
-
-def apply_ford_curvature_limits(apply_curvature, apply_curvature_last, current_curvature, v_ego_raw, steering_angle, lat_active, CP):
-  # No blending at low speed due to lack of torque wind-up and inaccurate current curvature
-  if v_ego_raw > 9:
-    apply_curvature = np.clip(apply_curvature, current_curvature - CarControllerParams.CURVATURE_ERROR,
-                              current_curvature + CarControllerParams.CURVATURE_ERROR)
-
-  # Curvature rate limit after driver torque limit
-  apply_curvature = apply_std_steer_angle_limits(apply_curvature, apply_curvature_last, v_ego_raw, steering_angle, lat_active, CarControllerParams.ANGLE_LIMITS)
-
-  # Ford Q4/CAN FD has more torque available compared to Q3/CAN so we limit it based on lateral acceleration.
-  # Safety is not aware of the road roll so we subtract a conservative amount at all times
-  if CP.flags & FordFlags.CANFD:
-    # Limit curvature to conservative max lateral acceleration
-    curvature_accel_limit = MAX_LATERAL_ACCEL / (max(v_ego_raw, 1) ** 2)
-    apply_curvature = float(np.clip(apply_curvature, -curvature_accel_limit, curvature_accel_limit))
-
-  return apply_curvature
 
 
 def apply_creep_compensation(accel: float, v_ego: float) -> float:
@@ -148,8 +105,12 @@ class CarController(CarControllerBase):
         apply_curvature = actuators.curvature
 
       current_curvature = -CS.out.yawRate / max(CS.out.vEgoRaw, 0.1)
-      apply_curvature = apply_ford_curvature_limits(apply_curvature, self.apply_curvature_last, current_curvature,
-                                                    CS.out.vEgoRaw, 0., CC.latActive, self.CP)
+      # No blending at low speed due to lack of torque wind-up and inaccurate current curvature
+      if CS.out.vEgoRaw > 9:
+        apply_curvature = float(np.clip(apply_curvature, current_curvature - CarControllerParams.CURVATURE_ERROR,
+                                        current_curvature + CarControllerParams.CURVATURE_ERROR))
+      apply_curvature = CarControllerParams.CURVATURE_LIMITS.apply_limits(apply_curvature, self.apply_curvature_last, CS.out.vEgoRaw,
+                                                                          0., CC.latActive, CarControllerParams.STEER_STEP)
       apply_angle = apply_ford_angle(actuators.steeringAngleDeg, CS)
 
       self.apply_curvature_last = apply_curvature
@@ -162,7 +123,7 @@ class CarController(CarControllerBase):
     if (self.frame % CarControllerParams.STEER_STEP) == 0:
       if self.CP.flags & FordFlags.CANFD:
         # TODO: extended mode
-        # Ford uses four individual signals to dictate how to drive to the car. Curvature alone (limited to 0.02m/s^2)
+        # Ford uses four individual signals to dictate how to drive to the car. Curvature alone (limited to 0.02 m^-1)
         # can actuate the steering for a large portion of any lateral movements. However, in order to get further control on
         # steer actuation, the other three signals are necessary. Ford controls vehicles differently than most other makes.
         # A detailed explanation on ford control can be found here:
@@ -182,11 +143,6 @@ class CarController(CarControllerBase):
 
         if time.time() - self.last_timeout_at > self.last_timeout_duration and lkas_available:
           self.last_timeout_duration = time.time() - self.last_timeout_at
-          near_timeout = False
-        elif time.time() - self.last_timeout_at >= self.last_timeout_duration - 500:
-          near_timeout = True
-        else:
-          near_timeout = False
 
         lka_active = cruise_enabled
         if lka_active:

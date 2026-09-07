@@ -82,7 +82,7 @@ def create_lat_ctl_msg(packer, CAN: CanBus, lat_active: bool, lateral_motion_con
   Frequency is 20Hz.
   """
 
-  values = {
+  _values = {
     "LatCtlRng_L_Max": lateral_motion_control["LatCtlRng_L_Max"],                       # Unknown [0|126] meter
     "HandsOffCnfm_B_Rq": lateral_motion_control["HandsOffCnfm_B_Rq"],                   # Unknown: 0=Inactive, 1=Active [0|1]
     "LatCtl_D_Rq": 0,                                                                      # Mode: 0=None, 1=ContinuousPathFollowing, 2=InterventionLeft,
