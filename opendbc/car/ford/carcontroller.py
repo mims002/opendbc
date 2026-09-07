@@ -10,13 +10,6 @@ from opendbc.car.interfaces import CarControllerBase, V_CRUISE_MAX
 LongCtrlState = structs.CarControl.Actuators.LongControlState
 VisualAlert = structs.CarControl.HUDControl.VisualAlert
 
-# Hard-coded LKA payload for bench testing.
-HARDCODED_LKA_APPLY_ANGLE_DEG = 2.93
-HARDCODED_LKA_CURVATURE = 0.0
-HARDCODED_LKA_DIRECTION = 2
-HARDCODED_LKA_RAMP_TYPE = 1
-HARDCODED_LKA_RAMP_STEP_DEG = 0.15
-
 
 def anti_overshoot(apply_curvature, apply_curvature_last, v_ego):
   diff = 0.1
@@ -68,7 +61,6 @@ class CarController(CarControllerBase):
     self.reset_count = 0
     self.last_timeout_at = time.time()
     self.last_timeout_duration = 100000000
-    self.lka_apply_angle_ramped = 0.0
 
   def update(self, CC, CS, now_nanos):
     can_sends = []
@@ -78,7 +70,6 @@ class CarController(CarControllerBase):
     lkas_available = getattr(CS, "lkas_available", True)
 
     main_on = CS.out.cruiseState.available
-    cruise_enabled = CS.out.cruiseState.enabled
     steer_alert = hud_control.visualAlert in (VisualAlert.steerRequired, VisualAlert.ldw)
     fcw_alert = hud_control.visualAlert == VisualAlert.fcw
 
@@ -143,24 +134,20 @@ class CarController(CarControllerBase):
 
         if time.time() - self.last_timeout_at > self.last_timeout_duration and lkas_available:
           self.last_timeout_duration = time.time() - self.last_timeout_at
-
-        lka_active = cruise_enabled
-        if lka_active:
-          self.lka_apply_angle_ramped = min(HARDCODED_LKA_APPLY_ANGLE_DEG,
-                                            self.lka_apply_angle_ramped + HARDCODED_LKA_RAMP_STEP_DEG)
-          lka_apply_angle = self.lka_apply_angle_ramped
-          lka_curvature = HARDCODED_LKA_CURVATURE
-          lka_direction = HARDCODED_LKA_DIRECTION
-          lka_ramp_type = HARDCODED_LKA_RAMP_TYPE
+          near_timeout = False
+        elif time.time() - self.last_timeout_at >= self.last_timeout_duration - 500:
+          near_timeout = True
         else:
-          self.lka_apply_angle_ramped = 0.0
-          lka_apply_angle = 0.0
-          lka_curvature = 0.0
-          lka_direction = 0
-          lka_ramp_type = 0
+          near_timeout = False
 
-        can_sends.append(fordcan.create_lka_msg(self.packer, self.CAN, lka_active,
-                                                lka_apply_angle, lka_curvature, lka_direction, lka_ramp_type))
+        if CC.latActive and lkas_available and not near_timeout:
+          new_direction = 2 if CS.out.steeringAngleDeg > 0 else 4
+        else:
+          new_direction = 0
+
+        ramp_type = 1 if abs(apply_angle) >= 5 else 0
+        can_sends.append(fordcan.create_lka_msg(self.packer, self.CAN, CC.latActive and lkas_available,
+                                                apply_angle, -apply_curvature, new_direction, ramp_type))
       else:
         can_sends.append(fordcan.create_lka_msg(self.packer, self.CAN, False, 0.0, 0.0, 0, 0))
 

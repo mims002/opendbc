@@ -1,9 +1,13 @@
 import random
 import unittest
+from types import SimpleNamespace
 
-from opendbc.car.structs import CarParams
+from opendbc.can import CANParser
+from opendbc.car import get_safety_config
+from opendbc.car.structs import CarControl, CarParams, CarState
 from opendbc.car.fw_versions import build_fw_dict
-from opendbc.car.ford.values import CAR, FW_QUERY_CONFIG, FW_PATTERN, get_platform_codes
+from opendbc.car.ford.carcontroller import CarController
+from opendbc.car.ford.values import CAR, DBC, FW_QUERY_CONFIG, FW_PATTERN, get_platform_codes
 from opendbc.car.ford.fingerprints import FW_VERSIONS
 from opendbc.testing import fuzzy_test, parameterized
 
@@ -36,6 +40,50 @@ ECU_PART_NUMBER = {
     b"14H102",  # Ford Q4
   ],
 }
+
+
+class TestFordBroncoLkaController(unittest.TestCase):
+  def test_lka_uses_openpilot_angle(self):
+    CP = CarParams.new_message()
+    CP.carFingerprint = CAR.FORD_BRONCO_MK6
+    CP.flags = int(CAR.FORD_BRONCO_MK6.config.flags)
+    CP.safetyConfigs = [get_safety_config(CarParams.SafetyModel.ford)]
+
+    CC = CarControl.new_message()
+    CC.latActive = True
+    CC.actuators.steeringAngleDeg = 4.0
+    CC.actuators.curvature = 0.001
+
+    car_state = CarState.new_message()
+    car_state.steeringAngleDeg = 1.0
+    car_state.vEgo = 5.0
+    car_state.vEgoRaw = 5.0
+    car_state.cruiseState.available = True
+    CS = SimpleNamespace(
+      out=car_state.as_reader(),
+      lkas_available=True,
+      acc_tja_status_stock_values={"Tja_D_Stat": 0},
+      buttons_stock_values={},
+      lateral_motion_control={},
+      lkas_status_stock_values={},
+    )
+
+    controller = CarController(DBC[CAR.FORD_BRONCO_MK6], CP.as_reader())
+    controller.frame = 3  # Lane_Assist_Data1 is sent at 33 Hz
+    controller.main_on_last = True
+    controller.lkas_enabled_last = True
+    controller.lead_distance_bars_last = 0
+
+    new_actuators, can_sends = controller.update(CC.as_reader(), CS, 0)
+    self.assertAlmostEqual(new_actuators.steeringAngleDeg, 4.0)
+    self.assertEqual(len(can_sends), 1)
+
+    parser = CANParser("ford_lincoln_base_pt", [("Lane_Assist_Data1", 0)], 0)
+    parser.update([1, can_sends])
+    lka = parser.vl["Lane_Assist_Data1"]
+    self.assertEqual(lka["LkaActvStats_D2_Req"], 2)
+    self.assertAlmostEqual(lka["LaRefAng_No_Req"], 52.35)  # (4 - 1) degrees in milliradians
+    self.assertEqual(lka["LaRampType_B_Req"], 0)
 
 
 class TestFordFW(unittest.TestCase):
